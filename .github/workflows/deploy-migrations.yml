@@ -1,0 +1,81 @@
+name: deploy-migrations
+
+# EF Core migrations, gated. See ADR-010.
+#
+# Two properties matter here and neither is achievable with a startup migration:
+#   1. the SQL is generated and published as a reviewable artefact first;
+#   2. applying it requires a human approving the GitHub environment.
+#
+# The database is in a private subnet with no internet route, so the apply step
+# has to run somewhere inside the VPC. A CodeBuild project attached to the
+# application subnets is the usual answer; it is documented rather than
+# provisioned because the CI platform was not confirmed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  script:
+    name: Generate the migration script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - run: dotnet tool install --global dotnet-ef
+
+      - name: Generate an idempotent script
+        run: |
+          # --idempotent guards every migration with an existence check, so the
+          # script is safe to re-run and safe to apply to a partially migrated
+          # database.
+          dotnet ef migrations script --idempotent --output migration.sql
+
+      - name: Fail on destructive statements
+        run: |
+          # A dropped column or table is not necessarily wrong, but it must
+          # never pass unnoticed. Expand/contract is the way through this.
+          if grep -inE '^\s*(DROP\s+(TABLE|COLUMN)|ALTER\s+TABLE\s+\S+\s+DROP)' migration.sql; then
+            echo "::error title=Destructive migration::This migration drops schema objects. Use an expand/contract sequence, or approve deliberately after review."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: migration-sql-${{ inputs.environment }}
+          path: migration.sql
+          retention-days: 30
+
+  apply:
+    name: Apply (requires approval)
+    needs: script
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-database
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: migration-sql-${{ inputs.environment }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.MIGRATION_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Apply inside the VPC
+        run: |
+          echo "Start the CodeBuild project that runs sqlcmd against the private endpoint."
+          echo "See docs/deployment.md, 'Database migrations', for the project definition."
+          exit 1  # deliberately unimplemented until the runner is provisioned

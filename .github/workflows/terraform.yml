@@ -1,0 +1,160 @@
+name: terraform
+
+# Infrastructure pipeline: fmt -> validate -> plan on every PR, apply only after
+# a human approves the GitHub environment. No AWS keys are stored anywhere; the
+# runner exchanges its OIDC token for a short-lived role session.
+#
+# Repository variables required (Settings -> Secrets and variables -> Actions):
+#   vars.AWS_REGION        deployment region, e.g. us-east-1
+#   vars.PROJECT_NAME      project slug, must match the `project` tfvar
+# Repository secrets required:
+#   secrets.TF_STATE_BUCKET   state bucket from terraform/bootstrap
+#   secrets.TF_PLAN_ROLE_ARN  github_plan_role_arn output
+#   secrets.TF_APPLY_ROLE_ARN apply role ARN
+#   secrets.DEPLOY_ROLE_ARN   github_deploy_role_arn output
+
+on:
+  pull_request:
+    paths: ["terraform/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to apply
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+permissions:
+  contents: read
+  id-token: write        # required to request the OIDC token
+  pull-requests: write   # required to post the plan summary
+
+env:
+  TF_VERSION: "1.13.3"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  validate:
+    name: fmt and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive terraform/
+
+      - name: terraform validate
+        run: |
+          for env in dev uat prod; do
+            echo "::group::validate $env"
+            terraform -chdir="terraform/environments/$env" init -backend=false -input=false
+            terraform -chdir="terraform/environments/$env" validate
+            echo "::endgroup::"
+          done
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, uat, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Assume the plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TF_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: |
+          terraform -chdir="terraform/environments/${{ matrix.environment }}" init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -input=false
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform -chdir="terraform/environments/${{ matrix.environment }}" plan \
+            -input=false -no-color -out=tfplan | tee plan.txt
+
+      - name: Fail on unexpected destruction
+        run: |
+          # A plan that destroys or replaces anything must be read by a human
+          # before it can merge, so surface it loudly rather than burying it.
+          if grep -qE '^Plan:.*[1-9][0-9]* to destroy' plan.txt; then
+            echo "::warning title=Destructive plan::This plan destroys resources. Review before merging."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan
+          retention-days: 5
+
+      - name: Comment the plan on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const body = [
+              '### Terraform plan — `${{ matrix.environment }}`',
+              '```terraform',
+              plan.length > 60000 ? plan.slice(-60000) : plan,
+              '```',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  apply:
+    name: apply (${{ inputs.environment }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: plan
+    runs-on: ubuntu-latest
+    # The GitHub environment is the approval gate. Configure required reviewers
+    # on it, otherwise this job runs unattended.
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: |
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -input=false
+
+      - name: terraform apply
+        run: |
+          terraform -chdir="terraform/environments/${{ inputs.environment }}" apply \
+            -input=false -auto-approve

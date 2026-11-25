@@ -1,0 +1,6 @@
+# Copy to backend.hcl and replace both placeholders.
+# The bucket is created by terraform/bootstrap; backend.hcl is gitignored
+# because it carries account-specific values.
+
+bucket = "<STATE_BUCKET_NAME>"
+region = "<AWS_REGION>"

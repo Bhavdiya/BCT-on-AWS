@@ -1,0 +1,78 @@
+name: deploy-api
+
+# Application pipeline for the ASP.NET Core API:
+#   build -> push to ECR -> register a new task definition -> update the
+#   service -> wait for it to stabilise.
+#
+# Database migrations are deliberately NOT run here. See ADR-010 and the
+# migrate job in deploy-migrations.yml, which is gated separately.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  DOTNET_VERSION: "8.0.x"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Test
+        run: dotnet test --configuration Release
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.PROJECT_NAME }}-${{ inputs.environment }}
+        run: |
+          # The immutable tag is the commit SHA, so a deployed image can always
+          # be traced back to exactly one commit.
+          TAG="${GITHUB_SHA::12}"
+          docker build -t "$REGISTRY/$REPOSITORY:$TAG" .
+          docker push "$REGISTRY/$REPOSITORY:$TAG"
+          echo "uri=$REGISTRY/$REPOSITORY:$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Render the task definition
+        id: taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: ${{ vars.PROJECT_NAME }}-${{ inputs.environment }}
+          container-name: api
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.task-definition }}
+          cluster: ${{ vars.PROJECT_NAME }}-${{ inputs.environment }}
+          service: ${{ vars.PROJECT_NAME }}-${{ inputs.environment }}
+          # The ECS circuit breaker rolls the deployment back on its own if the
+          # new tasks fail their health checks.
+          wait-for-service-stability: true

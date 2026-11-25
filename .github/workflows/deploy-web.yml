@@ -1,0 +1,62 @@
+name: deploy-web
+
+# Front-end pipeline: build the Vite bundle, sync it to S3, invalidate
+# CloudFront. Fingerprinted assets are uploaded before index.html so a viewer
+# never receives a shell that references assets which are not there yet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  NODE_VERSION: "20"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload fingerprinted assets
+        run: |
+          # Long cache lifetime is safe: Vite fingerprints these filenames.
+          aws s3 sync dist/ "s3://${{ secrets.SPA_BUCKET }}/" \
+            --delete \
+            --exclude index.html \
+            --cache-control "public,max-age=31536000,immutable"
+
+      - name: Upload the shell
+        run: |
+          # index.html must never be cached, it is how a new release is picked up.
+          aws s3 cp dist/index.html "s3://${{ secrets.SPA_BUCKET }}/index.html" \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      - name: Invalidate the edge cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/index.html" "/"

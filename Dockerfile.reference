@@ -1,0 +1,71 @@
+# Reference production Dockerfile for the BCT ASP.NET Core 8 API.
+#
+# WHY .reference AND NOT Dockerfile: the application repository was empty when
+# this was written, so the project paths below are placeholders. Rename this to
+# `Dockerfile` at the repository root and replace every REPLACE_ME before use.
+# Publishing it as a working Dockerfile would be inventing a project layout.
+#
+# What the infrastructure assumes about the resulting image, and what must be
+# checked against the real application (see application-discovery.md U1-U3):
+#   * listens on HTTP 8080          -> ALB target group port, ECS container port
+#   * exposes GET /healthz -> 200   -> ALB health check, container health check
+#   * writes structured logs to stdout -> awslogs driver
+#   * runs as a non-root user       -> ECS task hardening
+#   * does NOT run migrations at start -> ADR-010
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:8.0-noble AS build
+ARG BUILD_CONFIGURATION=Release
+WORKDIR /src
+
+# Copy only the project files first so `restore` is cached independently of
+# source changes. A source-only edit then skips the restore layer entirely.
+COPY ["REPLACE_ME.Api/REPLACE_ME.Api.csproj", "REPLACE_ME.Api/"]
+COPY ["REPLACE_ME.Domain/REPLACE_ME.Domain.csproj", "REPLACE_ME.Domain/"]
+COPY ["REPLACE_ME.Infrastructure/REPLACE_ME.Infrastructure.csproj", "REPLACE_ME.Infrastructure/"]
+RUN dotnet restore "REPLACE_ME.Api/REPLACE_ME.Api.csproj"
+
+COPY . .
+WORKDIR "/src/REPLACE_ME.Api"
+RUN dotnet publish "REPLACE_ME.Api.csproj" \
+      --configuration $BUILD_CONFIGURATION \
+      --no-restore \
+      --output /app/publish \
+      /p:UseAppHost=false
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+# aspnet, not sdk: the runtime image is a fraction of the size and carries no
+# compiler or package manager for an attacker to reach.
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-noble AS runtime
+
+# curl is only present so the ECS container health check can run. Drop this
+# layer and set enable_container_health_check = false if you would rather keep
+# the image minimal and rely on the ALB health check alone.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# The aspnet images ship a non-root `app` user (uid 1654). Using it means a
+# container escape does not start as root.
+USER app
+WORKDIR /app
+COPY --from=build --chown=app:app /app/publish .
+
+# 8080 rather than 80: a non-root process cannot bind a privileged port.
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
+    DOTNET_RUNNING_IN_CONTAINER=true
+EXPOSE 8080
+
+# ASPNETCORE_FORWARDEDHEADERS_ENABLED matters behind CloudFront and an ALB:
+# without it the application sees the load balancer's IP as the client address
+# and generates redirect URLs against the internal hostname.
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+ENTRYPOINT ["dotnet", "REPLACE_ME.Api.dll"]

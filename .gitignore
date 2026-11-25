@@ -1,0 +1,35 @@
+### Terraform ###
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Backend configuration carries account-specific bucket names.
+backend.hcl
+
+# Never commit real variable values; the checked-in tfvars hold no secrets and
+# are the exception.
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+*.tfplan
+
+# Lock files ARE committed on purpose: they pin provider versions.
+!.terraform.lock.hcl
+
+### Build output ###
+node_modules/
+dist/
+bin/
+obj/
+
+### Local ###
+.DS_Store
+.env
+.env.local
